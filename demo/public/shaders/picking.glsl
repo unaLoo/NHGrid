@@ -15,6 +15,7 @@ uniform mat4 uMatrix;
 uniform vec2 centerLow;
 uniform vec2 centerHigh;
 uniform mat4 pickingMatrix;
+uniform vec2 relativeCenter;
 
 out vec4 v_color;
 
@@ -85,18 +86,13 @@ uvec4 idToRGBA(uint id) {
 
 void main() {
 
-    // ivec2 dim = textureSize(storageTexture, 0).xy;
-
-    // int storage_u = gl_InstanceID % dim.x;
-    // int storage_v = gl_InstanceID / dim.x;
-
     vec2 layerMap[4] = vec2[4](
         tl,
         tr,
         bl,
         br
     );
-    vec2 xy = layerMap[gl_VertexID];
+    vec2 xy = layerMap[gl_VertexID] + relativeCenter;
 
     // vec2 xy = texelFetch(storageTexture, ivec3(storage_u, storage_v, layerMap[gl_VertexID]), 0).rg;
 

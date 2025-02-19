@@ -12,6 +12,7 @@ uniform vec2 centerLow;
 uniform vec2 centerHigh;
 uniform float lineWidth;
 uniform vec2 viewport;
+uniform vec2 relativeCenter;
 
 vec2 translateRelativeToEye(vec2 high, vec2 low) {
     vec2 highDiff = high - centerHigh;
@@ -27,8 +28,8 @@ void main() {
     vec2 xy = vec2(0.0);
     vec4 xy_CS = vec4(0.0);
     vec2 xy_SS = vec2(0.0);
-    vec2 p1 = pos.xy;
-    vec2 p2 = pos.zw;
+    vec2 p1 = pos.xy + relativeCenter;
+    vec2 p2 = pos.zw + relativeCenter;
     float parity = float(gl_VertexID % 2);
     bool isPositive = gl_VertexID / 2 == 0;
 
@@ -67,7 +68,7 @@ precision highp float;
 out vec4 fragColor;
 
 void main() {
-    fragColor = vec4(0.54, 0.97, 1.0, 1.0);
+    fragColor = vec4(1.0, 0.64, 0.36, 0.4);
 }
 
 #endif

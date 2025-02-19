@@ -10,6 +10,7 @@ layout(location = 0) in vec4 pos;
 uniform mat4 uMatrix;
 uniform vec2 centerLow;
 uniform vec2 centerHigh;
+uniform vec2 relativeCenter;
 uniform sampler2D paletteTexture;
 
 out vec3 v_color;
@@ -71,6 +72,7 @@ float stitching(float coord, float minVal, float delta, float edge) {
 }
 
 void main() {
+    
     vec2 xy = vec2(0.0);
     if (gl_VertexID % 2 == 0) {
         xy = pos.xy;
@@ -78,14 +80,8 @@ void main() {
         xy = pos.zw;
     }
 
-    // if (gl_InstanceID % 2 == 0) {
-    //     v_color = vec3(1.0, 1.0, 1.0);
-    // } else {
-    //     v_color = vec3(0.0, 0.0, 0.0);
-    // }
-
     v_color = texelFetch(paletteTexture, ivec2(gl_InstanceID % 5, 0), 0).rgb;
-    gl_Position = uMatrix * vec4(translateRelativeToEye(xy, vec2(0.0)), 0.0, 1.0);
+    gl_Position = uMatrix * vec4(translateRelativeToEye(xy + relativeCenter, vec2(0.0)), 0.0, 1.0);
 }
 
 #endif

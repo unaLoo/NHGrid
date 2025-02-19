@@ -1,23 +1,26 @@
 import proj4 from 'proj4'
-import { mat4 } from 'gl-matrix'
-import { MapMouseEvent } from 'mapbox-gl'
-// import { GUI, GUIController } from 'dat.gui'
 import axios from 'axios'
+import { mat4 } from 'gl-matrix'
+import { GUI, GUIController } from 'dat.gui'
+import { Map, MapMouseEvent } from 'mapbox-gl'
 
-import '../editor-style.css'
-import gll from './GlLib'
-import NHMap from './NHMap'
+import '../../editor-style.css'
+import gll from '../util/GlLib'
+import NHLayerGroup from '../NHLayerGroup'
 import FileDownloader from '../util/DownloadHelper'
-import BoundingBox2D from '../../src/core/util/boundingBox2D'
-import GridRecorder from '../../src/core/grid/NHGridRecorder'
-import VibrantColorGenerator from '../../src/core/util/vibrantColorGenerator'
+import BoundingBox2D from '../../../src/core/util/boundingBox2D'
+import GridRecorder from '../../../src/core/grid/NHGridRecorder'
+import { NHCustomLayerInterface } from '../util/interfaces'
+import { MercatorCoordinate } from '../../../src/core/math/mercatorCoordinate'
+import VibrantColorGenerator from '../../../src/core/util/vibrantColorGenerator'
 
 proj4.defs("ESRI:102140", "+proj=tmerc +lat_0=22.3121333333333 +lon_0=114.178555555556 +k=1 +x_0=836694.05 +y_0=819069.8 +ellps=intl +units=m +no_defs +type=crs")
+proj4.defs("EPSG:2326","+proj=tmerc +lat_0=22.3121333333333 +lon_0=114.178555555556 +k=1 +x_0=836694.05 +y_0=819069.8 +ellps=intl +towgs84=-162.619,-276.959,-161.764,-0.067753,2.243648,1.158828,-1.094246 +units=m +no_defs +type=crs")
 
-const STATUS_URL    = 'http://127.0.0.1:8000' + '/v0/mc/status'
-const RESULT_URL    = 'http://127.0.0.1:8000' + '/v0/mc/result'
-const DOWNLOAD_URL  = 'http://127.0.0.1:8000' + '/v0/fs/result/zip'
-const PROCESS_URL   = 'http://127.0.0.1:8000' + '/v0/nh/grid-process'
+const STATUS_URL = 'http://127.0.0.1:8000' + '/v0/mc/status'
+const RESULT_URL = 'http://127.0.0.1:8000' + '/v0/mc/result'
+const DOWNLOAD_URL = 'http://127.0.0.1:8000' + '/v0/fs/result/zip'
+const PROCESS_URL = 'http://127.0.0.1:8000' + '/v0/nh/grid-process'
 
 
 export interface GridLayerOptions {
@@ -26,14 +29,16 @@ export interface GridLayerOptions {
     edgeProperties?: string[]
 }
 
-export default class GridLayer {
+export default class GridLayer implements NHCustomLayerInterface {
 
     // Layer-related //////////////////////////////////////////////////
 
     type = 'custom'
     id = 'GridLayer'
     renderingMode = '3d'
-    isInitialized = false
+    initialized = false
+    visible = true
+    layerGroup!: NHLayerGroup
 
     // Function-related //////////////////////////////////////////////////
 
@@ -44,6 +49,11 @@ export default class GridLayer {
     gridRecorder: GridRecorder
     hitFlag = new Uint8Array([1])   // 0 is a special value and means no selection
     projConverter: proj4.Converter
+    
+    lastPickedId: number = -1
+
+    // Boundary center
+    relativeCenter = new Float32Array([0.0, 0.0])
 
     // GPU-related //////////////////////////////////////////////////
 
@@ -109,7 +119,7 @@ export default class GridLayer {
     private _EditorState: Record<string, string> = {
         editor: 'none',   // 'none' | 'topology' | 'attribute'
         tool: 'none',     // 'none' | 'brush' | 'box'
-        mode: 'none'      // 'none' | 'subdivide' | 'delete' | 'check'
+        mode: 'none'      // 'none' | 'check'
     }
     EditorState: Record<string, string> = {}
 
@@ -117,8 +127,8 @@ export default class GridLayer {
     activeAttrFeature: Record<string, any> = {}
     attrSetter: HTMLDivElement | null = null
     edgeDom: HTMLDivElement | null = null
-    isTopologyParsed = false
     showLoading: Function | null = null
+    isTopologyParsed = false
 
     typeChanged = false
     isShiftClick = false
@@ -131,12 +141,12 @@ export default class GridLayer {
     mousemoveHandler: Function
 
     // Dat.GUI
-    // gui: GUI
-    // capacityController: GUIController
-    // uiOption: { capacity: number, level: number }
+    gui: GUI
+    capacityController: GUIController
+    uiOption: { capacity: number, level: number }
 
     constructor(
-        public map: NHMap,
+        public map: Map,
         public srcCS: string,
         public firstLevelSize: [number, number],
         subdivideRules: [number, number][],
@@ -152,6 +162,13 @@ export default class GridLayer {
         boundaryCondition[2] = boundaryCondition[0] + Math.ceil((boundaryCondition[2] - boundaryCondition[0]) / this.firstLevelSize[0]) * this.firstLevelSize[0]
         boundaryCondition[3] = boundaryCondition[1] + Math.ceil((boundaryCondition[3] - boundaryCondition[1]) / this.firstLevelSize[1]) * this.firstLevelSize[1]
         this.bBox = new BoundingBox2D(...boundaryCondition)
+        
+        // Calculate relative center
+        const center = this.projConverter.forward([
+            (this.bBox.xMin + this.bBox.xMax) / 2.0,
+            (this.bBox.yMin + this.bBox.yMax) / 2.0,
+        ])
+        this.relativeCenter = new Float32Array(MercatorCoordinate.fromLonLat(center as [number, number]))
 
         // Set first level rule of subdivide rules by new boundary condition
         const modifiedSubdivideRules: [number, number][] = [[
@@ -202,23 +219,21 @@ export default class GridLayer {
         this.mousemoveHandler = this._mousemoveHandler.bind(this)
 
         // Init interaction option
-        // this.uiOption = {
-        //     level: 2,
-        //     capacity: 0.0,
-        // }
+        this.uiOption = {
+            level: 2,
+            capacity: 0.0,
+        }
 
         // Launch Dat.GUI
-        // this.gui = new GUI()
+        this.gui = new GUI()
         // const brushFolder = this.gui.addFolder('Brush')
         // brushFolder.add(this.uiOption, 'level', 1, this.subdivideRules.length - 1, 1)
         // brushFolder.open()
-        // this.gui.add(this.uiOption, 'capacity', 0, this.maxGridNum).name('Capacity').listen()
-        // this.gui.close()
-        // this.gui.hide()
+        this.gui.add(this.uiOption, 'capacity', 0, this.maxGridNum).name('Capacity').listen()
 
-        // this.capacityController = this.gui.__controllers[0]
-        // this.capacityController.setValue(0.0)
-        // this.capacityController.domElement.style.pointerEvents = 'none'
+        this.capacityController = this.gui.__controllers[0]
+        this.capacityController.setValue(0.0)
+        this.capacityController.domElement.style.pointerEvents = 'none'
     }
 
     get subdivideRules() {
@@ -304,6 +319,7 @@ export default class GridLayer {
                 <div class="tool-content f-row">
                   <div class="tool-item pic" id="brush" data-active="false" data-type="tool" data-val="brush"></div>
                   <div class="tool-item pic" id="box"   data-active="false" data-type="tool" data-val="box"></div>
+                  <div class="tool-item pic button-style" id="clear" data-val="clear"></div>
                 </div>
               </div>
               <div class="editor-container f-row">
@@ -312,8 +328,8 @@ export default class GridLayer {
                   <div class="editor-item p0_0_1_0" id="topology" data-active="false" data-type="editor" data-val="topology">
                     <div class="f-center p5_0 f1 editor-name">Topology-Editor</div>
                     <div class="f-row f-even">
-                      <div class="f0 sub-item p0_5" id="subdivide" data-active="false" data-type="mode" data-val="subdivide">Subdivide</div>
-                      <div class="f0 sub-item p0_5" id="delete"    data-active="false" data-type="mode" data-val="delete">Delete</div>
+                      <div class="f0 sub-item p0_5 button-style" id="subdivide" data-active="false" data-type="mode" data-val="subdivide">Subdivide</div>
+                      <div class="f0 sub-item p0_5 button-style" id="delete"    data-active="false" data-type="mode" data-val="delete">Delete</div>
                     </div>
                   </div>
                   <div class="editor-item" id="attribute" data-active="false" data-type="editor" data-val="attribute">
@@ -326,11 +342,21 @@ export default class GridLayer {
         document.body.appendChild(pannel)
 
         // [2] Setup Control Panne Surface Interaction
-        const ids = ['box', 'brush', 'topology', 'attribute', 'subdivide', 'delete']
+        const ids = ['box', 'brush', 'clear', 'topology', 'attribute', 'subdivide', 'delete']
         const doms = ids.map(id => document.querySelector(`#${id}`)! as HTMLDivElement)
 
         const handleClick = (dom: HTMLDivElement) => {
             const { type, val, active } = dom.dataset as { type: string, val: string, active: string }
+            if (type === 'mode') {
+                if (val === 'subdivide') this.subdivideActiveGrids()
+                else if (val === 'delete') this.deleteActiveGrids()
+                return
+            }
+            if (val === 'clear') {
+                this.clearActiveGrids() 
+                return
+            }
+            
             if (active === 'true' && val === 'topology') {
                 for (let dom of doms) {
                     if (dom.dataset.type === 'mode' && dom.dataset.active === 'true') {
@@ -341,34 +367,25 @@ export default class GridLayer {
             else if (active === 'true') {
                 dom.dataset.active = 'false' //only cancel the active
                 this.EditorState[type] = 'none'
-                val === 'attribute' && (this.EditorState.mode = 'none')
                 return
             }
+
             deactivate(type)
             activate.call(this, dom)
             this.EditorState[type] = val
 
             // Local helper
             function deactivate(type: string) {
-                doms.forEach(d => d.dataset.type === type && (d.dataset.active = 'false'))
-                requestAnimationFrame(() => {
-                    type === "editor" && deactivate("mode")
-                })
+                if (type !== 'mode') doms.forEach(d => d.dataset.type === type && (d.dataset.active = 'false'))
             }
 
             function activate(this: GridLayer, dom: HTMLDivElement) {
-                dom.dataset.active = 'true'
-                if (dom.dataset.val === "topology") {
-                    requestAnimationFrame(() => {
-                        const modeDom = doms.find(d => d.dataset.val === this.EditorState.mode)
-                        modeDom && (modeDom!.dataset.active = 'true')
-                    })
-                }
+                if (type !== 'mode') dom.dataset.active = 'true'
             }
         }
 
         doms.forEach((dom: HTMLDivElement) => {
-            (dom).addEventListener('click', _ => { handleClick(dom) })
+            dom.addEventListener('click', _ => handleClick(dom))
         })
 
         // [3] Setup Control Panne Core Interaction
@@ -397,7 +414,7 @@ export default class GridLayer {
         initState(/* defaultState */ {
             editor: 'topology',
             tool: 'brush',
-            mode: 'subdivide'
+            mode: 'none'
         })
 
         // [4] Remove Event handler for map boxZoom
@@ -423,6 +440,14 @@ export default class GridLayer {
                 this.map.triggerRepaint()
             }
         })
+
+        // [6.5] Add event listener for <Esc> (Clear hitset)
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                this.clearActiveGrids()
+            }
+        })
+
 
         // [7] Init the attrSettor DOM
         this.initAttrSetter({
@@ -471,9 +496,9 @@ export default class GridLayer {
                             try {
                                 const data = JSON.parse(reader.result as string)
                                 this.gridRecorder.deserialize(data)
-                                // Checkout to topology-editor
+                                    // Checkout to topology-editor
                                     ; (document.querySelector("#subdivide") as HTMLDivElement).dataset.active = "false"
-                                    ; (document.querySelector("#subdivide") as HTMLDivElement).click() 
+                                    ; (document.querySelector("#subdivide") as HTMLDivElement).click()
 
                             } catch (err) {
                                 console.error('Error parsing JSON file:', err)
@@ -708,7 +733,7 @@ export default class GridLayer {
                 this.updateGPUGrids(infos)
 
                 // Raise flag when the root grid (level: 0, globalId: 0) has been subdivided
-                this.isInitialized = true
+                this.initialized = true
                 this.showLoading!(false)
             })
         })
@@ -722,7 +747,6 @@ export default class GridLayer {
             .off('mousemove', this.mousemoveHandler as any)
             .off('mouseout', this.mouseoutHandler as any)
             .off('resize', this.resizeHandler as any)
-
     }
 
     addTopologyEditorUIHandler() {
@@ -749,50 +773,29 @@ export default class GridLayer {
             .on('resize', this.resizeHandler as any)
     }
 
-    hit(storageIds: number | number[]) {
-        // Topology editor
-        if (this.EditorState.editor === "topology") {
-            // Delete mode
-            if (this.EditorState.mode === 'delete') {
-                if (Array.isArray(storageIds))
-                    this.removeGrids(storageIds)
-                else
-                    storageIds >= 0 && this.removeGrid(storageIds)
+    hit(storageIds: number | number[], isMaintained = false) {
+
+        const ids = Array.isArray(storageIds) ? storageIds : [storageIds]
+        ids.forEach(storageId => {
+            if (storageId < 0) return
+
+            if (!isMaintained && this.hitSet.has(storageId)) {
+
+                if (this.hitSet.size === 1) return
+                this.hitSet.delete(storageId)
+
+            } else {
+                this.hitSet.add(storageId)
             }
-            // Subdivider type
-            else if (this.EditorState.mode === 'subdivide') {
-
-                const ids = Array.isArray(storageIds) ? storageIds : [storageIds]
-                ids.forEach((storageId: number) => {
-                    if (storageId < 0) return
-
-                    const maxLevel = this.subdivideRules.length - 1
-                    const [hitLevel] = this.gridRecorder.getGridInfoByStorageId(storageId)
-
-                    // Nothing will happen if the hit grid has the maximize level
-                    if (hitLevel >= maxLevel) return
-
-                    this.hitSet.add(storageId)
-                })
-            }
-        }
-        // Attribute editor
-        else if (this.EditorState.editor === "attribute") {
-            const ids = Array.isArray(storageIds) ? storageIds : [storageIds]
-            ids.forEach((storageId: number) => {
-                if (storageId < 0) return
-                this.hitSet.add(storageId) //only storage when attribute-editor
-            })
-        }
-
+        })
         this.map.triggerRepaint()
     }
 
     hitAttributeEditor() {
 
         if (!this.isTopologyParsed) return
-        if (this.EditorState.tool === "brush") this._hitAttribute()
-        else if (this.EditorState.tool === "box") this._hitAttributes()
+        if (this.hitSet.size === 1) this._hitAttribute()
+        else if (this.hitSet.size > 1) this._hitAttributes()
     }
 
     removeGrid(storageId: number) {
@@ -815,59 +818,71 @@ export default class GridLayer {
         this.gridRecorder.subdivideGrids(infos, this.updateGPUGrids)
     }
 
+    subdivideActiveGrids() {
+
+        // Parse hitSet
+        const subdividableUUIDs = new Array<string>()
+        const removableStorageIds = new Array<number>()
+        this.hitSet.forEach(removableStorageId => {
+
+            const level = this.gridRecorder.getGridInfoByStorageId(removableStorageId)[0]
+            
+            // Nothing will happen if the hit grid has the maximize level
+            if (level === this.gridRecorder.maxLevel) return
+
+            // Add removable grids
+            removableStorageIds.push(removableStorageId)
+
+            // Add subdividable grids
+            subdividableUUIDs.push(this.gridRecorder.getGridInfoByStorageId(removableStorageId).join('-'))
+        })
+
+        if (subdividableUUIDs.length === 1) {
+            this.removeGrid(removableStorageIds[0])
+            this.subdivideGrid(subdividableUUIDs[0])
+        }
+        else {
+            this.removeGrids(removableStorageIds)
+            this.subdivideGrids(subdividableUUIDs)
+        }
+        this.hitSet.clear()
+    }
+
+    deleteActiveGrids() {
+        this.removeGrids(Array.from(this.hitSet))
+        this.hitSet.clear()
+    }
+
+    clearActiveGrids() {
+        this.hitSet.clear()
+        this._updateHitFlag()
+        this.map.triggerRepaint()
+    }
+
     tickGrids() {
 
+        // Highlight all hit grids //////////////////////////////
+
         if (this.hitSet.size === 0) return
+        // Update hit flag for this current frame
+        this._updateHitFlag()
 
-        if (this.EditorState.editor === "topology") {
+        // Update grid signal buffer
+        const gl = this._gl
+        gl.bindBuffer(gl.ARRAY_BUFFER, this._gridSignalBuffer)
+        this.hitSet.forEach(hitStorageId => gl.bufferSubData(gl.ARRAY_BUFFER, hitStorageId, this.hitFlag, 0))
+        gl.bindBuffer(gl.ARRAY_BUFFER, null)
 
-            // Parse hitSet
-            const subdividableUUIDs = new Array<string>()
-            const removableStorageIds = new Array<number>()
-            this.hitSet.forEach(removableStorageId => {
+        // Process editor actions //////////////////////////////
 
-                // Check if valid
-                // if (removableLevel >= toLevel || toLevel - removableLevel > 1) return
-
-                // Add removable grids
-                removableStorageIds.push(removableStorageId)
-
-                // Add subdividable grids
-                subdividableUUIDs.push(this.gridRecorder.getGridInfoByStorageId(removableStorageId).join('-'))
-            })
-
-            if (subdividableUUIDs.length === 1) {
-                this.removeGrid(removableStorageIds[0])
-                this.subdivideGrid(subdividableUUIDs[0])
-            }
-            else {
-                this.removeGrids(removableStorageIds)
-                this.subdivideGrids(subdividableUUIDs)
-            }
-
-        }
-        else if (this.EditorState.editor === "attribute") {
-
-            if (this.hitSet.size !== 0) {
-                // Update hit flag for this current frame
-                this._updateHitFlag()
-
-                // Highlight all hit grids
-                const gl = this._gl
-                gl.bindBuffer(gl.ARRAY_BUFFER, this._gridSignalBuffer)
-                this.hitSet.forEach(hitStorageId => gl.bufferSubData(gl.ARRAY_BUFFER, hitStorageId, this.hitFlag, 0))
-                gl.bindBuffer(gl.ARRAY_BUFFER, null)
-            }
-
+        if (this.EditorState.editor === "attribute") {
             this.hitAttributeEditor()
-
         }
 
-        this.hitSet.clear()
         this.typeChanged = false
     }
 
-    async onAdd(_: NHMap, gl: WebGL2RenderingContext) {
+    async initialize(_: Map, gl: WebGL2RenderingContext) {
 
         this._gl = gl
         await this.init()
@@ -876,10 +891,11 @@ export default class GridLayer {
     render(gl: WebGL2RenderingContext, _: number[]) {
 
         // Skip if not ready
-        if (!this.isInitialized || !this.gridRecorder.isReady) return
+        if (!this.initialized || !this.gridRecorder.isReady) return
+
+        if (!this.visible) return
 
         // Tick logic
-        this.map.update()
         this.tickGrids()
 
         // Tick render
@@ -896,11 +912,12 @@ export default class GridLayer {
         gll.errorCheck(gl)
 
         // Update display of capacity
-        // this.uiOption.capacity = this.gridRecorder.gridNum
-        // this.capacityController.updateDisplay()
+        this.uiOption.capacity = this.gridRecorder.gridNum
+        this.capacityController.updateDisplay()
     }
 
     picking(e: MapMouseEvent, e2: MapMouseEvent | undefined = undefined) {
+
         let storageIds
         if (e2) { //box mode
             const canvas = this._gl.canvas as HTMLCanvasElement
@@ -929,10 +946,11 @@ export default class GridLayer {
         gl.activeTexture(gl.TEXTURE0)
         gl.bindTexture(gl.TEXTURE_2D, this._paletteTexture)
         gl.uniform1i(gl.getUniformLocation(this._gridMeshShader, 'hit'), this.hitFlag[0])
-        gl.uniform2fv(gl.getUniformLocation(this._gridMeshShader, 'centerLow'), this.map.centerLow)
-        gl.uniform2fv(gl.getUniformLocation(this._gridMeshShader, 'centerHigh'), this.map.centerHigh)
+        gl.uniform2fv(gl.getUniformLocation(this._gridMeshShader, 'relativeCenter'), this.relativeCenter)
+        gl.uniform2fv(gl.getUniformLocation(this._gridMeshShader, 'centerLow'), this.layerGroup.centerLow)
+        gl.uniform2fv(gl.getUniformLocation(this._gridMeshShader, 'centerHigh'), this.layerGroup.centerHigh)
         gl.uniform1f(gl.getUniformLocation(this._gridMeshShader, 'mode'), this.isTopologyParsed ? 1.0 : 0.0)
-        gl.uniformMatrix4fv(gl.getUniformLocation(this._gridMeshShader, 'uMatrix'), false, this.map.relativeEyeMatrix)
+        gl.uniformMatrix4fv(gl.getUniformLocation(this._gridMeshShader, 'uMatrix'), false, this.layerGroup.relativeEyeMatrix)
 
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.gridRecorder.gridNum)
     }
@@ -947,9 +965,10 @@ export default class GridLayer {
 
         gl.bindVertexArray(this._gridStorageVAO)
 
-        gl.uniform2fv(gl.getUniformLocation(this._gridLineShader, 'centerLow'), this.map.centerLow)
-        gl.uniform2fv(gl.getUniformLocation(this._gridLineShader, 'centerHigh'), this.map.centerHigh)
-        gl.uniformMatrix4fv(gl.getUniformLocation(this._gridLineShader, 'uMatrix'), false, this.map.relativeEyeMatrix)
+        gl.uniform2fv(gl.getUniformLocation(this._gridLineShader, 'relativeCenter'), this.relativeCenter)
+        gl.uniform2fv(gl.getUniformLocation(this._gridLineShader, 'centerLow'), this.layerGroup.centerLow)
+        gl.uniform2fv(gl.getUniformLocation(this._gridLineShader, 'centerHigh'), this.layerGroup.centerHigh)
+        gl.uniformMatrix4fv(gl.getUniformLocation(this._gridLineShader, 'uMatrix'), false, this.layerGroup.relativeEyeMatrix)
 
         gl.drawArraysInstanced(gl.LINE_LOOP, 0, 4, this.gridRecorder.gridNum)
     }
@@ -968,9 +987,10 @@ export default class GridLayer {
 
         gl.bindVertexArray(this._edgeStorageVAO)
 
-        gl.uniform2fv(gl.getUniformLocation(this._edgeShader, 'centerLow'), this.map.centerLow)
-        gl.uniform2fv(gl.getUniformLocation(this._edgeShader, 'centerHigh'), this.map.centerHigh)
-        gl.uniformMatrix4fv(gl.getUniformLocation(this._edgeShader, 'uMatrix'), false, this.map.relativeEyeMatrix)
+        gl.uniform2fv(gl.getUniformLocation(this._edgeShader, 'relativeCenter'), this.relativeCenter)
+        gl.uniform2fv(gl.getUniformLocation(this._edgeShader, 'centerLow'), this.layerGroup.centerLow)
+        gl.uniform2fv(gl.getUniformLocation(this._edgeShader, 'centerHigh'), this.layerGroup.centerHigh)
+        gl.uniformMatrix4fv(gl.getUniformLocation(this._edgeShader, 'uMatrix'), false, this.layerGroup.relativeEyeMatrix)
 
         gl.drawArraysInstanced(gl.LINE_STRIP, 0, 2, this.gridRecorder.edgeNum)
 
@@ -979,12 +999,24 @@ export default class GridLayer {
 
         gl.bindVertexArray(this._edgeRibbonedVAO)
 
+        gl.uniform2fv(gl.getUniformLocation(this._edgeRibbonedShader, 'relativeCenter'), this.relativeCenter)
+        gl.uniform2fv(gl.getUniformLocation(this._edgeRibbonedShader, 'centerLow'), this.layerGroup.centerLow)
+        gl.uniform2fv(gl.getUniformLocation(this._edgeRibbonedShader, 'centerHigh'), this.layerGroup.centerHigh)
         gl.uniform2fv(gl.getUniformLocation(this._edgeRibbonedShader, 'viewport'), [gl.canvas.width, gl.canvas.height])
-        gl.uniform2fv(gl.getUniformLocation(this._edgeRibbonedShader, 'centerLow'), this.map.centerLow)
-        gl.uniform2fv(gl.getUniformLocation(this._edgeRibbonedShader, 'centerHigh'), this.map.centerHigh)
-        gl.uniformMatrix4fv(gl.getUniformLocation(this._edgeRibbonedShader, 'uMatrix'), false, this.map.relativeEyeMatrix)
+        gl.uniformMatrix4fv(gl.getUniformLocation(this._edgeRibbonedShader, 'uMatrix'), false, this.layerGroup.relativeEyeMatrix)
 
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this._assignedEdges.length)
+    }
+
+    remove(_: Map, __: WebGL2RenderingContext) {
+    }
+
+    show() {
+        this.visible = true
+    }
+
+    hide() {
+        this.visible = false
     }
 
     /**
@@ -1010,10 +1042,11 @@ export default class GridLayer {
 
         gl.bindVertexArray(this._gridStorageVAO)
 
-        gl.uniform2fv(gl.getUniformLocation(this._pickingShader, 'centerLow'), this.map.centerLow)
-        gl.uniform2fv(gl.getUniformLocation(this._pickingShader, 'centerHigh'), this.map.centerHigh)
+        gl.uniform2fv(gl.getUniformLocation(this._pickingShader, 'relativeCenter'), this.relativeCenter)
+        gl.uniform2fv(gl.getUniformLocation(this._pickingShader, 'centerLow'), this.layerGroup.centerLow)
+        gl.uniform2fv(gl.getUniformLocation(this._pickingShader, 'centerHigh'), this.layerGroup.centerHigh)
         gl.uniformMatrix4fv(gl.getUniformLocation(this._pickingShader, 'pickingMatrix'), false, pickingMatrix)
-        gl.uniformMatrix4fv(gl.getUniformLocation(this._pickingShader, 'uMatrix'), false, this.map.relativeEyeMatrix)
+        gl.uniformMatrix4fv(gl.getUniformLocation(this._pickingShader, 'uMatrix'), false, this.layerGroup.relativeEyeMatrix)
 
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.gridRecorder.gridNum)
 
@@ -1066,10 +1099,11 @@ export default class GridLayer {
 
         gl.bindVertexArray(this._gridStorageVAO)
 
-        gl.uniform2fv(gl.getUniformLocation(this._pickingShader, 'centerLow'), this.map.centerLow)
-        gl.uniform2fv(gl.getUniformLocation(this._pickingShader, 'centerHigh'), this.map.centerHigh)
+        gl.uniform2fv(gl.getUniformLocation(this._pickingShader, 'relativeCenter'), this.relativeCenter)
+        gl.uniform2fv(gl.getUniformLocation(this._pickingShader, 'centerLow'), this.layerGroup.centerLow)
+        gl.uniform2fv(gl.getUniformLocation(this._pickingShader, 'centerHigh'), this.layerGroup.centerHigh)
         gl.uniformMatrix4fv(gl.getUniformLocation(this._pickingShader, 'pickingMatrix'), false, boxPickingMatrix)
-        gl.uniformMatrix4fv(gl.getUniformLocation(this._pickingShader, 'uMatrix'), false, this.map.relativeEyeMatrix)
+        gl.uniformMatrix4fv(gl.getUniformLocation(this._pickingShader, 'uMatrix'), false, this.layerGroup.relativeEyeMatrix)
 
         gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, this.gridRecorder.gridNum)
 
@@ -1179,6 +1213,7 @@ export default class GridLayer {
     private _mouseupHandler(e: MapMouseEvent) {
 
         if (this.EditorState.editor === "topology" || this.EditorState.editor === "attribute") {
+
             if (this.isShiftClick) {
 
                 this.map.dragPan.enable()
@@ -1201,7 +1236,7 @@ export default class GridLayer {
 
                 } else {
 
-                    this.hit(storageIds)
+                    this.hit(storageIds, true)
                 }
 
                 clear(this._ctx!)
@@ -1218,6 +1253,8 @@ export default class GridLayer {
             if (this.isShiftClick && this.EditorState.tool === 'brush') {
                 this.map.dragPan.disable()
                 const storageId = this.picking(e) as number
+                if (this.lastPickedId === storageId) return
+                this.lastPickedId = storageId
                 this.hit(storageId)
             }
 
@@ -1261,6 +1298,7 @@ export default class GridLayer {
     }
 
     private _resizeHandler() {
+
         // Resize canvas 2d
         const canvas = this._ctx!.canvas
         if (canvas.width !== canvas.clientWidth || canvas.height !== canvas.clientHeight) {
@@ -1274,28 +1312,36 @@ export default class GridLayer {
     }
 
     private _handleStateSet(target: Record<string, string>, prop: string, value: string): boolean {
+
         if (!(prop in target))
             throw new Error(`Property ${prop} does not exist on editorControl`)
 
         target[prop] = value
         switch (prop) {
             case 'editor':
-                console.log('set editor ', value)
+                console.log('Set editor ', value)
                 this.typeChanged = true
                 switch (value) {
                     case 'topology':
+
+                        this.clearActiveGrids()
+
                         this.attrSetter!.style.display = 'none'
                         const pannel = document.querySelector('#pannel') as HTMLDivElement
                         pannel.style.height = '200px'
-                        // reset state, attr cache, gridSignalBuffer
+
+                        // Reset state, attr cache, gridSignalBuffer
                         this.isTopologyParsed = false
                         this.gridRecorder.resetEdges()
                         this.gridRecorder.resetGrids()
-                        this._resetHitFlag()
                         this.addTopologyEditorUIHandler()
 
                         break
+
                     case 'attribute':
+                        
+                        this.clearActiveGrids()
+
                         this.addAttributeEditorUIHandler()
                         this.showLoading!(true)
 
@@ -1338,13 +1384,15 @@ export default class GridLayer {
                 }
                 this.map.triggerRepaint()
                 break
+
             case 'tool':
                 console.log('set tool ', value)
-                // do nothing extra
+                // Do nothing extra
                 break
+
             case 'mode':
-                console.log('set mode ', value)
-                // do nothing extra
+                // console.log('set mode ', value)
+                // Do nothing extra
                 break
         }
         return true
@@ -1389,14 +1437,17 @@ export default class GridLayer {
         } else {
             this._setCacheBatchInfo(this.activeAttrFeature.id, this.activeAttrFeature.t, this.activeAttrFeature.height, this.activeAttrFeature.type)
         }
+
+        this.map.triggerRepaint()
     }
 
 
-    initAttrSetter(info: any) {
-        //////// parse grid and edge info
+    private initAttrSetter(info: any) {
+
+        // Parse grid and edge info ////////////////////////////////////////
         const { gridStorageId, top, left, bottom, right } = info
 
-        // default :: grid clicked
+        // Default: grid clicked
         const [height, type] = this._getInfoFromCache(gridStorageId, 0) // 0 grid, 1 edge
         this.activeAttrFeature.id = gridStorageId
         this.activeAttrFeature.dom = null
@@ -1404,7 +1455,7 @@ export default class GridLayer {
         this.activeAttrFeature.height = height
         this.activeAttrFeature.type = type
 
-        //////// set HTML
+        // Set HTML //////////////////////////////////////////////////
         const html = genAttrEditorHTML({ top, left, bottom, right }, { id: gridStorageId, height, type })
         const attrSetter = this.attrSetter = document.createElement('div')
         attrSetter.id = 'attrSetter'
@@ -1412,12 +1463,12 @@ export default class GridLayer {
         attrSetter.innerHTML = html
         document.body.appendChild(attrSetter)
 
-        //////// set Handler
+        //////// Set Handler
         const edgeDom = this.edgeDom = document.querySelector('#edges') as HTMLDivElement
         const handleEdgeClick = this._handleAttrEdgeClick.bind(this)
         edgeDom.addEventListener('click', handleEdgeClick)
 
-        // grid click 
+        // Grid click 
         const attrTypeDom = document.querySelector('#attr_type') as HTMLDivElement
         attrTypeDom.addEventListener('click', e => {
 
@@ -1437,7 +1488,7 @@ export default class GridLayer {
                 ; (document.querySelector('#type') as HTMLInputElement).value = type + ''
         })
 
-        // input commit when "enter" down
+        // Input commit when 'enter' down
         const handleAttrSetterKeyDown = this._handleAttrSetterKeyDown.bind(this)
         this.attrSetter.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') handleAttrSetterKeyDown(e)
@@ -1446,9 +1497,9 @@ export default class GridLayer {
         this.attrSetter.style.display = 'none'
     }
 
-    updateAttrSetter(info: any) {
+    private updateAttrSetter(info: any) {
 
-        if (this.EditorState.tool === 'box') {
+        if (this.hitSet.size > 1) {
             const gridStorageIds = info.gridStorageId
 
             this.activeAttrFeature.id = gridStorageIds
@@ -1457,7 +1508,7 @@ export default class GridLayer {
             this.activeAttrFeature.height = -9999
             this.activeAttrFeature.type = 0
 
-            // reset grid dom data-id and input value
+            // Reset grid dom data-id and input value
             const attrTypeDom = document.querySelector('#attr_type') as HTMLDivElement
             attrTypeDom.dataset.id = '-1'
             attrTypeDom.textContent = 'Grid'
@@ -1479,12 +1530,12 @@ export default class GridLayer {
                 ; (document.querySelector('#height') as HTMLInputElement).value = -9999 + ''
                 ; (document.querySelector('#type') as HTMLInputElement).value = 0 + ''
 
-        } else if (this.EditorState.tool === 'brush') {
+        } else if (this.hitSet.size === 1) {
 
-            //////// parse grid and edge info
+            // Parse grid and edge info
             const { top, left, bottom, right, gridStorageId } = info
 
-            // reset default :: grid clicked
+            // Reset default :: grid clicked
             const [height, type] = this._getInfoFromCache(gridStorageId, 0) // 0 grid, 1 edge
             this.activeAttrFeature.id = gridStorageId
             this.activeAttrFeature.dom = null
@@ -1492,7 +1543,7 @@ export default class GridLayer {
             this.activeAttrFeature.height = height
             this.activeAttrFeature.type = type
 
-            // reset grid dom data-id and input value
+            // Reset grid dom data-id and input value
             const attrTypeDom = document.querySelector('#attr_type') as HTMLDivElement
             attrTypeDom.dataset.id = gridStorageId
             attrTypeDom.textContent = 'Grid'
@@ -1500,7 +1551,7 @@ export default class GridLayer {
                 ; (document.querySelector('#height') as HTMLInputElement).value = height + ''
                 ; (document.querySelector('#type') as HTMLInputElement).value = type + ''
 
-            // reset edges dom
+            // Reset edges dom
             const topHtml = genEdgeHTML("top", top as number[])
             const leftHtml = genEdgeHTML("left", left as number[])
             const bottomHtml = genEdgeHTML("bottom", bottom as number[])
@@ -1563,7 +1614,7 @@ export default class GridLayer {
             this.gridRecorder.edge_attribute_cache[ID].height = height
             this.gridRecorder.edge_attribute_cache[ID].type = type
 
-            // update array of assigned edges
+            // Update array of assigned edges
             if (this._vertexBuffer !== null) {
                 for (let i = 0; i < 4; i++) {
                     if (!this._assignedEdges.includes(ID)) {
@@ -1578,6 +1629,7 @@ export default class GridLayer {
     }
 
     private _setCacheBatchInfo(IDs: number[], T: number = 0, height: number, type: number) {
+
         if (!this.isTopologyParsed) {
             throw "Topology Not Parsed!!" //never
         }
@@ -1615,6 +1667,7 @@ export default class GridLayer {
     }
 
     private _updateRibbonedEdges() {
+        
         let tempArray: number[] = []
         this._assignedEdges.forEach((ID) => {
             for (let i = 0; i < 4; i++) {
@@ -1642,15 +1695,6 @@ export default class GridLayer {
         }
 
         this.hitFlag[0] = this.hitFlag[0] + 1
-    }
-
-    private _resetHitFlag() {
-        if (this._gridSignalBuffer) {
-            const gl = this._gl
-            gl.bindBuffer(gl.ARRAY_BUFFER, this._gridSignalBuffer)
-            gl.bufferData(gl.ARRAY_BUFFER, this.maxGridNum * 2 * 1, gl.DYNAMIC_DRAW)
-            gl.bindBuffer(gl.ARRAY_BUFFER, null)
-        }
     }
 
     // Fast function to upload one grid rendering info to GPU stograge texture

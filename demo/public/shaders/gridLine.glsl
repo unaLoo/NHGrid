@@ -15,7 +15,7 @@ layout(location = 5) in uint assignment;
 uniform mat4 uMatrix;
 uniform vec2 centerLow;
 uniform vec2 centerHigh;
-// uniform sampler2DArray storageTexture;
+uniform vec2 relativeCenter;
 
 const float PI = 3.141592653;
 
@@ -77,11 +77,6 @@ float stitching(float coord, float minVal, float delta, float edge) {
 
 void main() {
 
-    // ivec2 dim = textureSize(storageTexture, 0).xy;
-
-    // int storage_u = gl_InstanceID % dim.x;
-    // int storage_v = gl_InstanceID / dim.x;
-
     vec2 layerMap[4] = vec2[4](
         tl,
         tr,
@@ -90,7 +85,7 @@ void main() {
     );
 
     // vec2 xy = texelFetch(storageTexture, ivec3(storage_u, storage_v, layerMap[gl_VertexID]), 0).rg;
-    vec2 xy = layerMap[gl_VertexID];
+    vec2 xy = layerMap[gl_VertexID] + relativeCenter;
     gl_Position = uMatrix * vec4(translateRelativeToEye(xy, vec2(0.0)), 0.0, 1.0);
 }
 
@@ -103,7 +98,7 @@ precision highp float;
 out vec4 fragColor;
 
 void main() {
-    fragColor = vec4(1.0);
+    fragColor = vec4(1.0, 1.0, 1.0, 0.2);
 }
 
 #endif
